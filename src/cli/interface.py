@@ -27,7 +27,7 @@ class Interface:
     def prompt_media_path(self) -> str | None:
         """Ask for a path. Returns ``None`` on quit/EOF/Ctrl+C."""
         try:
-            raw = self.console.input(f"[{PALETTE.text}]Enter media path:[/]\n[{PALETTE.accent}]>[/] ")
+            raw = self.console.input(f"[{PALETTE.text}]Paste YouTube URL or media path:[/]\n[{PALETTE.accent}]>[/] ")
         except (EOFError, KeyboardInterrupt):
             self.console.print()
             return None
@@ -56,3 +56,15 @@ class Interface:
     def show_summary(self, stats: PlaybackStats) -> None:
         """Print playback summary."""
         self.console.print(build_summary(stats))
+
+    def step(self, text: str) -> None:
+        """Print a progress step like ``[+] Reading media information``."""
+        self.console.print(f"[{PALETTE.accent}]\\[+][/] [{PALETTE.text}]{text}[/]")
+
+    def show_notice(self, message: str) -> None:
+        """Print a dim informational line."""
+        self.console.print(f"[{PALETTE.dim}]{message}[/]")
+
+    def show_warning(self, message: str) -> None:
+        """Print a warning line."""
+        self.console.print(f"[{PALETTE.warning}]![/] [{PALETTE.text}]{message}[/]")

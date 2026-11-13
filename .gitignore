@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ASCII Music Player runtime data
+data/cache/*
+!data/cache/.gitkeep

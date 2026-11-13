@@ -41,6 +41,19 @@ class AppConfig:
     drop_frames: bool = True
     show_stats: bool = True
     log_to_file: bool = False
+    # --- Phase 2: audio / lyrics / controls ---
+    volume: int = 80
+    volume_step: int = 5
+    seek_step: float = 5.0
+    show_lyrics: bool = True
+    show_video: bool = True
+    lyrics_enabled: bool = True
+    lyrics_timeout: float = 20.0
+    lyrics_api_url: str = "https://lrclib.net/api"
+    #: Explicit path to the mpv executable; ``None`` searches PATH and common locations.
+    mpv_path: str | None = None
+    #: Maximum UI redraw rate (frames of video are still picked from the audio clock).
+    ui_fps: float = 24.0
 
     def __post_init__(self) -> None:
         if self.ascii_width < 10:
@@ -49,6 +62,10 @@ class AppConfig:
             raise ConfigError("char_aspect must be positive")
         if self.fps is not None and self.fps <= 0:
             raise ConfigError("fps must be positive")
+        if not 0 <= self.volume <= 130:
+            raise ConfigError("volume must be between 0 and 130")
+        if self.ui_fps <= 0:
+            raise ConfigError("ui_fps must be positive")
         if self.charset is not None and len(self.charset) < 2:
             raise ConfigError("charset needs at least 2 characters")
 
