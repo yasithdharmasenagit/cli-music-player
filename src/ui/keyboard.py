@@ -20,6 +20,9 @@ class Key(Enum):
     VOLUME_DOWN = "volume_down"
     TOGGLE_LYRICS = "toggle_lyrics"
     TOGGLE_VIDEO = "toggle_video"
+    QUALITY_LOW = "quality_low"
+    QUALITY_MEDIUM = "quality_medium"
+    QUALITY_HIGH = "quality_high"
 
 
 _PLAIN = {
@@ -27,6 +30,7 @@ _PLAIN = {
     "q": Key.QUIT, "Q": Key.QUIT, "\x03": Key.QUIT,  # Ctrl+C arrives as a character in raw mode
     "l": Key.TOGGLE_LYRICS, "L": Key.TOGGLE_LYRICS,
     "v": Key.TOGGLE_VIDEO, "V": Key.TOGGLE_VIDEO,
+    "1": Key.QUALITY_LOW, "2": Key.QUALITY_MEDIUM, "3": Key.QUALITY_HIGH,
 }
 # Windows extended-key codes, sent after a '\x00' or '\xe0' prefix.
 _WINDOWS_EXT = {"H": Key.VOLUME_UP, "P": Key.VOLUME_DOWN, "K": Key.SEEK_BACK, "M": Key.SEEK_FORWARD}

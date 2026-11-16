@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -290,6 +291,19 @@ class MpvIpcClient:
 # --------------------------------------------------------------------------- backend
 
 
+def _kill_process(proc: Any) -> None:
+    """Last-resort cleanup (interpreter exit / garbage collection): never leave mpv running."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+
+
 class AudioBackend(Protocol):
     """What :class:`~src.audio.audio_controller.AudioController` needs from an audio engine."""
 
@@ -299,6 +313,87 @@ class AudioBackend(Protocol):
     def seek_absolute(self, seconds: float) -> None: ...
     def set_volume(self, volume: int) -> None: ...
     def stop(self) -> None: ...
+
+
+def _attach_kill_on_close_job(pid: int | None) -> int | None:
+    """Windows: put process *pid* in a job object that kills it when our process ends.
+
+    The returned handle must stay open for as long as the child should live; Windows closes it
+    when this process dies for any reason (including *End task*), which terminates mpv. This
+    closes the one gap that ``atexit``/``finally`` cannot: a forced kill of the app.
+
+    Returns ``None`` (and does nothing) on other platforms or if the job cannot be created.
+    """
+    if sys.platform != "win32" or not pid:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                        ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                                     wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits))
+        process = kernel32.OpenProcess(0x0100 | 0x0001, False, pid)  # SET_QUOTA | TERMINATE
+        assigned = bool(process) and bool(kernel32.AssignProcessToJobObject(job, process))
+        if process:
+            kernel32.CloseHandle(process)
+        if not ok or not assigned:
+            kernel32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:  # best effort only: never let this break playback
+        return None
+
+
+def _close_job(handle: int | None) -> None:
+    """Release a job handle from :func:`_attach_kill_on_close_job` (kills anything still in it)."""
+    if handle is None or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        close = ctypes.WinDLL("kernel32").CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close(handle)
+    except Exception:
+        pass
 
 
 class MpvBackend:
@@ -320,6 +415,8 @@ class MpvBackend:
         self._proc: Any | None = None
         self._ipc: MpvIpcClient | None = None
         self._closing = False
+        self._finalizer: weakref.finalize | None = None  # type: ignore[type-arg]
+        self._job: int | None = None  # Windows kill-on-close job holding mpv
 
     # -- lifecycle
 
@@ -337,6 +434,10 @@ class MpvBackend:
                 "--input-default-bindings=no"]
         if user_agent:
             args.append(f"--user-agent={user_agent}")
+        if source.lower().startswith(("http://", "https://")):
+            # Network source: reconnect after dropped connections and never hang on a dead socket.
+            args += ["--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
+                     "--network-timeout=15", "--cache=yes"]
         args += ["--", source]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         try:
@@ -345,6 +446,10 @@ class MpvBackend:
         except OSError as exc:
             raise AudioPlaybackError(f"Could not start mpv: {exc.strerror or exc}") from exc
         proc = self._proc
+        # Safety nets: kill mpv if this process is killed outright (job object, Windows), and at
+        # interpreter exit / garbage collection even if stop() is never reached.
+        self._job = _attach_kill_on_close_job(getattr(proc, "pid", None))
+        self._finalizer = weakref.finalize(self, _kill_process, proc)
         try:
             transport = self._connect(address, lambda: proc.poll() is None)
             self._ipc = MpvIpcClient(transport, self._on_event, self._on_disconnect)
@@ -377,6 +482,11 @@ class MpvBackend:
                         proc.kill()
                     except OSError:
                         pass
+        if self._finalizer is not None:
+            self._finalizer.detach()
+            self._finalizer = None
+        _close_job(self._job)
+        self._job = None
 
     # -- commands
 

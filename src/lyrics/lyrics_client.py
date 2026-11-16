@@ -79,9 +79,11 @@ class LrclibProvider:
         try:
             candidates = self._candidates(query)
         except httpx.TimeoutException:
+            _log.warning("LRCLIB request timed out")
             return Lyrics(LyricsStatus.ERROR, source=self.name,
                           message="Lyrics service is slow or unreachable (timed out).")
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as exc:
+            _log.warning("LRCLIB request failed: %s", type(exc).__name__)
             return Lyrics(LyricsStatus.ERROR, source=self.name,
                           message="Lyrics unavailable (network or service problem).")
         return self._choose(candidates, query)
@@ -151,13 +153,16 @@ class LrclibProvider:
 class LyricsCache:
     """On-disk cache of successful lookups (JSON, one file per track)."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, max_entries: int = 500) -> None:
         self._dir = directory
+        self._max = max_entries  # 0 disables caching
 
     def _path(self, query: LyricsQuery) -> Path:
         return self._dir / f"{query.cache_key}.json"
 
     def get(self, query: LyricsQuery) -> Lyrics | None:
+        if self._max <= 0:
+            return None
         try:
             data = json.loads(self._path(query).read_text(encoding="utf-8"))
             return Lyrics(
@@ -169,8 +174,23 @@ class LyricsCache:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
+    def prune(self) -> int:
+        """Delete the oldest entries beyond ``max_entries``. Returns how many were removed."""
+        try:
+            files = sorted(self._dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return 0
+        removed = 0
+        for path in files[:max(0, len(files) - self._max)]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     def put(self, query: LyricsQuery, lyrics: Lyrics) -> None:
-        if lyrics.status not in (LyricsStatus.SYNCED, LyricsStatus.INSTRUMENTAL,
+        if self._max <= 0 or lyrics.status not in (LyricsStatus.SYNCED, LyricsStatus.INSTRUMENTAL,
                                  LyricsStatus.UNSYNCED):
             return
         payload = {"status": lyrics.status.value, "source": lyrics.source,
@@ -178,6 +198,7 @@ class LyricsCache:
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             self._path(query).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            self.prune()
         except OSError as exc:
             _log.warning("Could not write lyrics cache: %s", exc)
 
@@ -204,6 +225,7 @@ class LyricsService:
             return self._memo[query.cache_key]
         cached = self._cache.get(query) if self._cache else None
         if cached is not None:
+            _log.info("Lyrics for '%s' served from cache (%s)", query.title, cached.status.value)
             self._memo[query.cache_key] = cached
             return cached
         best: Lyrics | None = None
@@ -219,6 +241,8 @@ class LyricsService:
             if best is None or _rank(result) > _rank(best):
                 best = result
         best = best or Lyrics(LyricsStatus.NOT_FOUND)
+        _log.info("Lyrics lookup for '%s': %s%s", query.title, best.status.value,
+                  f" via {best.source}" if best.source else "")
         if self._cache:
             self._cache.put(query, best)
         if best.status is not LyricsStatus.ERROR:

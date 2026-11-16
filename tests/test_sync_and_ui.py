@@ -7,7 +7,15 @@ from rich.console import Console
 
 from src.lyrics.lyrics_models import LyricsWindow
 from src.ui.keyboard import Key, KeyReader, decode_ansi, decode_windows
-from src.ui.player_view import HEADER_ROWS, ViewState, build_player_view, progress_bar, video_area
+from src.ui.player_view import (
+    HEADER_ROWS,
+    ViewState,
+    build_loading_view,
+    build_player_view,
+    progress_bar,
+    video_area,
+    volume_bar,
+)
 from src.video.video_loader import VideoLoader
 from src.video.video_sync import (
     SyncAction,
@@ -152,6 +160,12 @@ def test_video_area_adapts_to_terminal_and_panels():
     assert video_area(1, 1, True) == (1, 1)  # tiny terminals never produce zero/negative sizes
 
 
+def test_volume_bar():
+    assert volume_bar(0) == "░" * 10 and volume_bar(100) == "█" * 10
+    assert volume_bar(50) == "█" * 5 + "░" * 5
+    assert volume_bar(130) == "█" * 10 and volume_bar(-5) == "░" * 10
+
+
 def test_progress_bar():
     assert progress_bar(0, 100, 12) == "[" + "-" * 10 + "]"
     assert progress_bar(50, 100, 12) == "[=====-----]"
@@ -166,12 +180,22 @@ def test_view_shows_all_sections():
                       lyrics=LyricsWindow(("before",), ("NOW LINE",), ("after",), 3))
     text = render_text(state)
     for needle in ["ASCII MUSIC PLAYER", "NOW PLAYING", "Song", "Band", "@@@@", "before",
-                   "NOW LINE", "after", "01:24 / 04:12", "Playing", "Volume: 80%", "["]:
+                   "NOW LINE", "after", "01:24 / 04:12", "Playing", "Volume", "80%", "[", "━"]:
         assert needle in text, needle
 
 
 def test_view_states():
-    assert "Loading" in render_text(ViewState(title="t", loading="Preparing playback…"))
+    loading = ViewState(title="Song", artist="Band", loading="x", loading_steps=[
+        ("Media information", "done"), ("Audio engine", "active"), ("Lyrics", "fail"),
+        ("Video stream", "skip")])
+    console = Console(width=80, height=24, force_terminal=False, record=True, file=io.StringIO())
+    console.print(build_loading_view(loading))
+    card = console.export_text()
+    for needle in ["ASCII MUSIC PLAYER", "Watch music. Differently.", "Song", "Band", "✓ Media information",
+                   "Audio engine…", "✗ Lyrics (unavailable)", "Q to cancel"]:
+        assert needle in card, needle
+    notice = render_text(ViewState(title="t", notice="Video stream interrupted", notice_kind="warn"))
+    assert "Video stream interrupted" in notice
     assert "Paused" in render_text(ViewState(title="t", paused=True))
     assert "Audio only" in render_text(ViewState(title="t", audio_only=True))
     assert "Searching for lyrics" in render_text(ViewState(title="t", lyrics_message="Searching for lyrics…"))
@@ -188,3 +212,16 @@ def test_view_survives_any_terminal_size(size):
     render_text(ViewState(title="x" * 300, artist="y" * 300, ascii_frame="@" * 500,
                           lyrics=LyricsWindow(("a" * 400,), ("b" * 400,), ("c" * 400,))),
                 width=size[0], height=size[1])
+
+
+def test_quality_keys_decode_on_windows_and_posix():
+    assert KeyReader(ListChars(["1", "2", "3"]), windows=True).poll() == [
+        Key.QUALITY_LOW, Key.QUALITY_MEDIUM, Key.QUALITY_HIGH]
+    assert KeyReader(ListChars(["1", "2", "3"]), windows=False).poll() == [
+        Key.QUALITY_LOW, Key.QUALITY_MEDIUM, Key.QUALITY_HIGH]
+    assert KeyReader(ListChars(["4", "0"]), windows=True).poll() == []  # other digits are ignored
+
+
+def test_footer_shows_quality_and_the_hint_for_the_keys():
+    text = render_text(ViewState(title="t", quality="medium", paused=False), width=120)
+    assert "quality medium" in text and "1/2/3 quality" in text

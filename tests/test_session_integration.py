@@ -139,9 +139,9 @@ def test_video_follows_audio_clock_not_wall_time(make_video):
     session, mpv, buf = build("video", video, duration=3.0, script=[(0.4, " "), (1.3, "q")])
     result = session.run()
     assert result.quit_by_user
-    # ~0.4s of playback at 20 fps = ~8 frames, then paused for 0.9 s (would be ~18 more frames
-    # if video ran on its own clock)
-    assert 2 <= result.frames_decoded + result.frames_skipped <= 14
+    # ~0.4 s of playback at 20 fps = ~8 frames reach the screen; during the 0.9 s pause the
+    # picture must not advance (it would be ~26 frames if the video ran on its own clock).
+    assert 2 <= result.frames_delivered <= 11
     assert ("pause", True) in mpv.calls
 
 

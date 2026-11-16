@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+import platform
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
+from pathlib import Path
 
 from rich.markup import escape
 
+from src._version import __version__
 from src.audio.audio_controller import AudioController
 from src.audio.audio_player import MpvBackend, find_mpv
 from src.audio.playback_clock import PlaybackClock
@@ -21,6 +24,11 @@ from src.core.exceptions import (
     MediaUnavailableError,
     MpvNotFoundError,
 )
+from src.core.user_config import (
+    describe_config,
+    load_config_file,
+    write_example_config,
+)
 from src.lyrics.lyrics_client import LrclibProvider, LyricsCache, LyricsService
 from src.lyrics.lyrics_models import Lyrics
 from src.media.media_resolver import MediaResolver, ResolvedMedia
@@ -28,73 +36,125 @@ from src.media.youtube_resolver import looks_like_url
 from src.player.session import PlaybackSession, SessionResult
 from src.ui.keyboard import KeyReader
 from src.ui.terminal_renderer import TerminalRenderer
-from src.utils.dependencies import ffmpeg_available
+from src.utils.dependencies import checks_exit_code, ffmpeg_available, run_checks
 from src.utils.logger import configure_logging, get_logger
-from src.utils.paths import CACHE_DIR, validate_media_path
+from src.utils.paths import default_cache_dir, default_config_path, validate_media_path
 from src.video.ascii_converter import ASCIIConverter
 from src.video.video_loader import VideoLoader
 from src.video.video_player import PlaybackStats, VideoPlayer
 
 _log = get_logger("cli")
 
+QUALITY_CHOICES = ["low", "medium", "balanced", "high", "standard"]  # medium/standard = balanced
+
 
 def build_parser() -> argparse.ArgumentParser:
-    """Create the argument parser."""
-    p = argparse.ArgumentParser(prog="ascii-music-player",
-                                description="Play music videos as ASCII art with audio and lyrics.")
+    """Create the argument parser. Options default to ``None`` so the config file can supply them."""
+    p = argparse.ArgumentParser(
+        prog="ascii-music-player",
+        description="Play music videos as ASCII art, with audio and synchronized lyrics.",
+        epilog="Settings can be stored in a config file; see --init-config. "
+               "Command-line options override the file.")
     p.add_argument("path", nargs="?", help="YouTube URL or local media path (prompted if omitted)")
-    p.add_argument("-w", "--width", type=int, default=DEFAULT_CONFIG.ascii_width,
-                   help="maximum ASCII width in characters (default: %(default)s)")
-    p.add_argument("-q", "--quality", choices=[q.name.lower() for q in Quality],
-                   default=DEFAULT_CONFIG.quality.name.lower(), help="character detail level")
-    p.add_argument("--charset", help="custom characters, dark to bright (overrides --quality)")
-    p.add_argument("--fps", type=float, help="override playback FPS (silent mode only)")
-    p.add_argument("--color", action="store_true", help="coloured ANSI output")
-    p.add_argument("--invert", action="store_true", help="invert brightness")
-    p.add_argument("--volume", type=int, default=DEFAULT_CONFIG.volume, help="initial volume 0-130")
-    p.add_argument("--title", help="track title to use for the lyrics search")
-    p.add_argument("--artist", help="artist to use for the lyrics search")
-    p.add_argument("--ui-fps", type=float, default=DEFAULT_CONFIG.ui_fps,
-                   help="maximum screen redraws per second (default: %(default)s); "
-                        "lower it if the picture freezes")
-    p.add_argument("--no-lyrics", action="store_true", help="do not search for lyrics")
-    p.add_argument("--no-video", action="store_true", help="start with the ASCII video hidden")
-    p.add_argument("--no-audio", action="store_true",
-                   help="silent mode: local video only, no mpv needed (Phase 1 player)")
-    p.add_argument("--mpv-path", help="path to the mpv executable")
-    p.add_argument("--no-stats", action="store_true", help="hide the status line (silent mode)")
-    p.add_argument("--no-alt-screen", action="store_true", help="render inline, not in the alternate screen")
-    p.add_argument("--no-drop", action="store_true", help="never drop frames (silent mode)")
-    p.add_argument("--log", action="store_true", help="write a log file to data/cache/")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    tools = p.add_argument_group("setup and diagnostics")
+    tools.add_argument("--doctor", action="store_true", help="check dependencies and environment, then exit")
+    tools.add_argument("--init-config", action="store_true",
+                       help="create a commented config file (if missing), then exit")
+    tools.add_argument("--show-config", action="store_true", help="show the effective settings, then exit")
+    tools.add_argument("--config", metavar="FILE", help="use this config file instead of the default")
+
+    video = p.add_argument_group("picture")
+    video.add_argument("-q", "--quality", choices=QUALITY_CHOICES,
+                       help="low = fast, medium (= balanced, default), high = most detail")
+    video.add_argument("-w", "--width", type=int, help="maximum ASCII width in characters (0 = automatic)")
+    video.add_argument("--charset", help="custom characters, dark to bright (overrides the quality's)")
+    video.add_argument("--color", action=argparse.BooleanOptionalAction, default=None,
+                       help="coloured ANSI output")
+    video.add_argument("--invert", action=argparse.BooleanOptionalAction, default=None,
+                       help="invert brightness")
+    video.add_argument("--stabilize", action=argparse.BooleanOptionalAction, default=None,
+                       help="calm shimmer from video compression noise (default on)")
+    video.add_argument("--video", dest="show_video", action=argparse.BooleanOptionalAction,
+                       default=None, help="show the ASCII video at start (--no-video hides it)")
+    video.add_argument("--ui-fps", type=float, help="maximum screen redraws per second (0 = automatic)")
+    video.add_argument("--alt-screen", action=argparse.BooleanOptionalAction, default=None,
+                       help="use the terminal's alternate screen")
+
+    audio = p.add_argument_group("audio and lyrics")
+    audio.add_argument("--volume", type=int, help="initial volume 0-130")
+    audio.add_argument("--mpv-path", help="path to the mpv executable")
+    audio.add_argument("--lyrics", dest="lyrics_enabled", action=argparse.BooleanOptionalAction,
+                       default=None, help="look up lyrics (--no-lyrics disables)")
+    audio.add_argument("--title", help="track title to use for the lyrics search")
+    audio.add_argument("--artist", help="artist to use for the lyrics search")
+
+    misc = p.add_argument_group("storage and logging")
+    misc.add_argument("--cache-dir", help="folder for cached lyrics and logs")
+    misc.add_argument("--no-log", action="store_true", help="do not write a log file")
+    misc.add_argument("--log-level", choices=["debug", "info", "warning", "error"],
+                      help="log verbosity (default info)")
+
+    silent = p.add_argument_group("silent mode")
+    silent.add_argument("--no-audio", action="store_true",
+                        help="play a local video silently (no mpv needed)")
+    silent.add_argument("--fps", type=float, help="override playback FPS (silent mode)")
+    silent.add_argument("--no-stats", action="store_true", help="hide the status line (silent mode)")
+    silent.add_argument("--no-drop", action="store_true", help="never drop frames (silent mode)")
     return p
 
 
-def config_from_args(args: argparse.Namespace) -> AppConfig:
-    """Translate parsed CLI arguments into an :class:`AppConfig`."""
-    return DEFAULT_CONFIG.with_overrides(
-        ascii_width=args.width,
-        quality=Quality[args.quality.upper()],
-        charset=args.charset,
-        fps=args.fps,
-        color=args.color,
-        invert=args.invert,
-        volume=args.volume,
-        ui_fps=args.ui_fps,
-        lyrics_enabled=not args.no_lyrics,
-        show_video=not args.no_video,
-        mpv_path=args.mpv_path,
-        show_stats=not args.no_stats,
-        alt_screen=not args.no_alt_screen,
-        drop_frames=not args.no_drop,
-        log_to_file=args.log,
-    )
+def config_from_args(args: argparse.Namespace, base: AppConfig = DEFAULT_CONFIG) -> AppConfig:
+    """Layer explicitly given command-line options on top of *base* (defaults + config file)."""
+    changes: dict[str, object] = {}
+    if args.quality is not None:
+        changes["quality"] = Quality.parse(args.quality)
+    if args.width is not None:
+        changes["ascii_width"] = args.width or None
+    if args.ui_fps is not None:
+        changes["ui_fps"] = args.ui_fps or None
+    if args.charset is not None:
+        changes["charset"] = args.charset or None
+    if args.cache_dir is not None:
+        changes["cache_dir"] = Path(args.cache_dir).expanduser()
+    if args.log_level is not None:
+        changes["log_level"] = args.log_level.upper()
+    if args.no_log:
+        changes["log_enabled"] = False
+    if args.no_stats:
+        changes["show_stats"] = False
+    if args.no_drop:
+        changes["drop_frames"] = False
+    for name in ("color", "invert", "stabilize", "show_video", "alt_screen", "lyrics_enabled"):
+        if getattr(args, name) is not None:
+            changes[name] = getattr(args, name)
+    for name in ("volume", "mpv_path", "fps"):
+        if getattr(args, name) is not None:
+            changes[name] = getattr(args, name)
+    return base.with_overrides(**changes)
+
+
+def load_settings(args: argparse.Namespace) -> tuple[AppConfig, list[str], Path, bool]:
+    """Defaults < config file < command line.
+
+    Returns:
+        ``(config, warnings, config_path, config_file_exists)``
+
+    Raises:
+        ConfigError: invalid config file or option value.
+    """
+    explicit = Path(args.config).expanduser() if args.config else None
+    path = explicit or default_config_path()
+    file_config, warnings = load_config_file(path, DEFAULT_CONFIG, must_exist=explicit is not None)
+    return config_from_args(args, file_config), warnings, path, path.exists()
 
 
 # --------------------------------------------------------------------------- silent (Phase 1)
 
 
 def play_file(raw_path: str, config: AppConfig, ui: Interface) -> PlaybackStats:
-    """Phase 1 behaviour: validate, load and play one local video without audio.
+    """Silent mode: validate, load and play one local video without audio.
 
     Raises:
         AsciiPlayerError: on any expected failure (bad path, bad video, bad frame).
@@ -104,11 +164,12 @@ def play_file(raw_path: str, config: AppConfig, ui: Interface) -> PlaybackStats:
     renderer = TerminalRenderer(config, ui.console)
     with VideoLoader(path) as loader:
         info = loader.info
-        width = min(config.ascii_width, renderer.available_cols())
+        width = min(config.effective_width, renderer.available_cols())
         converter = ASCIIConverter(
             width=width, charset=config.active_charset, invert=config.invert,
             color=config.color, char_aspect=config.char_aspect,
-            max_rows=renderer.available_rows(),
+            max_rows=renderer.available_rows(), interpolation=config.interpolation,
+            stabilize=config.stabilize, chunk=config.chunk, enhance=config.enhance,
         )
         cols, rows = converter.output_size(info.width, info.height)
         ui.show_video_info(info, cols, rows)
@@ -119,15 +180,24 @@ def play_file(raw_path: str, config: AppConfig, ui: Interface) -> PlaybackStats:
 # --------------------------------------------------------------------------- full player
 
 
-def make_lyrics_fetcher(media: ResolvedMedia, config: AppConfig):  # type: ignore[no-untyped-def]
+def cache_dir_for(config: AppConfig) -> Path:
+    """The folder used for lyrics and logs."""
+    return config.cache_dir or default_cache_dir()
+
+
+def make_lyrics_fetcher(media: ResolvedMedia, config: AppConfig) -> Callable[[], Lyrics]:
     """Return a zero-arg callable that looks up lyrics (cached) for *media*."""
+    provider = LrclibProvider(config.lyrics_api_url, config.lyrics_timeout)
     service = LyricsService(
-        [LrclibProvider(config.lyrics_api_url, config.lyrics_timeout)],
-        LyricsCache(CACHE_DIR / "lyrics"),
+        [provider],
+        LyricsCache(cache_dir_for(config) / "lyrics", config.lyrics_cache_max_entries),
     )
 
     def fetch() -> Lyrics:
-        return service.fetch(media.metadata)
+        try:
+            return service.fetch(media.metadata)
+        finally:
+            provider.close()  # release the HTTP connection pool
 
     return fetch
 
@@ -135,6 +205,8 @@ def make_lyrics_fetcher(media: ResolvedMedia, config: AppConfig):  # type: ignor
 def play_media(raw: str, config: AppConfig, ui: Interface, title: str | None = None,
                artist: str | None = None) -> SessionResult:
     """Resolve *raw* (URL or path) and play it with audio, ASCII video and lyrics.
+
+    Every call builds fresh components, so repeated play requests never share state.
 
     Raises:
         AsciiPlayerError: any expected failure, with a user-presentable message.
@@ -176,11 +248,12 @@ def _report_session(result: SessionResult, ui: Interface) -> int:
         ui.show_warning(
             f"The screen stalled {result.stalls}x (longest {result.max_stall:.1f}s; slowest redraw "
             f"{result.max_render_ms:.0f} ms; longest gap between audio clock reports "
-            f"{result.max_clock_gap:.2f}s). Re-run with --log and share data/cache/player.log.")
+            f"{result.max_clock_gap:.2f}s). Lower the quality (-q low) or --ui-fps; details are in "
+            f"the log file.")
     if result.video_recoveries:
         ui.show_notice(f"The video stream dropped {result.video_recoveries}x and was reconnected.")
     state = "stopped" if result.quit_by_user else "finished"
-    ui.show_notice(f"Playback {state}. {result.frames_decoded} video frames shown, "
+    ui.show_notice(f"Playback {state}. {result.frames_delivered} video frames shown, "
                    f"{result.frames_skipped} skipped to stay in sync.")
     return 0
 
@@ -192,7 +265,8 @@ def _explain(exc: AsciiPlayerError, raw: str, ui: Interface) -> None:
     elif isinstance(exc, InvalidURLError):
         ui.show_notice("Paste a link such as https://www.youtube.com/watch?v=... or a file path.")
     elif isinstance(exc, MpvNotFoundError):
-        ui.show_notice("Tip: run with --no-audio to play a local video silently.")
+        ui.show_notice("Tip: run  ascii-music-player --doctor  to check your setup, or use "
+                       "--no-audio to play a local video silently.")
 
 
 def _ensure_utf8_streams() -> None:
@@ -206,17 +280,49 @@ def _ensure_utf8_streams() -> None:
                 pass
 
 
+def _run_tool_command(args: argparse.Namespace, config: AppConfig, config_path: Path,
+                      exists: bool, ui: Interface) -> int | None:
+    """Handle --init-config / --show-config / --doctor. Returns an exit code, or None to play."""
+    cache_dir = cache_dir_for(config)
+    if args.init_config:
+        created = write_example_config(config_path)
+        ui.show_notice(f"{'Created' if created else 'Already exists (not overwritten)'}: {config_path}")
+        return 0
+    if args.show_config:
+        for label, value in describe_config(config, config_path, exists, cache_dir):
+            ui.console.print(f"[dim]{escape(label):<14}[/] {escape(value)}")
+        return 0
+    if args.doctor:
+        checks = run_checks(config, config_path, cache_dir)
+        ui.show_checks(checks)
+        return checks_exit_code(checks)
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the application. Returns a process exit code."""
     _ensure_utf8_streams()
     args = build_parser().parse_args(argv)
     ui = Interface()
     try:
-        config = config_from_args(args)
+        config, warnings, config_path, exists = load_settings(args)
     except AsciiPlayerError as exc:
         ui.show_error(escape(str(exc)))
         return 2
-    configure_logging(config.log_to_file)
+    log_path = configure_logging(config.log_enabled, config.log_level, cache_dir_for(config) / "logs")
+    _log.info("ascii-music-player %s on Python %s, %s", __version__, platform.python_version(),
+              platform.platform())
+    for warning in warnings:
+        _log.warning("config: %s", warning)
+        ui.show_warning(warning)
+
+    tool_result = _run_tool_command(args, config, config_path, exists, ui)
+    if tool_result is not None:
+        return tool_result
+    if log_path is not None:
+        _log.info("log file: %s", log_path)
+    if not args.no_audio:
+        run_checks(config, config_path, cache_dir_for(config))  # results go to the log file
 
     ui.show_banner()
     raw = args.path
@@ -230,20 +336,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.no_audio:
                 stats = play_file(raw, config, ui)
                 ui.show_summary(stats)
-                return 0
-            return _report_session(play_media(raw, config, ui, args.title, args.artist), ui)
+                code = 0
+            else:
+                code = _report_session(play_media(raw, config, ui, args.title, args.artist), ui)
         except AsciiPlayerError as exc:
-            _log.warning("Playback failed: %s", type(exc).__name__)
+            _log.warning("Playback failed: %s: %s", type(exc).__name__, exc)
             _explain(exc, raw, ui)
-            if not interactive:
-                return 1
-            raw = None
+            code = 1
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # unexpected: never leave a traceback on a restored terminal
             _log.exception("Unexpected failure")
-            ui.show_error(escape(f"Unexpected error: {type(exc).__name__}: {exc}"))
-            return 1
+            ui.show_error(escape(f"Unexpected error: {type(exc).__name__}: {exc}. "
+                                 f"Details are in the log file."))
+            code = 1
+        if not interactive:
+            return code
+        raw = None  # interactive: ask for the next track (q quits)
+        ui.console.print()
 
 
 if __name__ == "__main__":

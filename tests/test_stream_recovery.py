@@ -135,6 +135,7 @@ def test_recovery_backoff_and_eventual_success(make_video):
     ft = FakeTime()
     attempts = []
     with VideoLoader(path) as loader:
+        loader.is_stream = True  # network behaviour: keep retrying with back-off
         src = SyncedVideoSource(loader, clock=ft)
         src.frame_at(0.0)
         real_reopen = loader.reopen
@@ -159,6 +160,23 @@ def test_recovery_backoff_and_eventual_success(make_video):
     gaps = [round(b - a, 1) for a, b in zip(attempts, attempts[1:])]
     assert gaps[:3] == [0.5, 0.5, 1.0]  # delays 0, 0.5, 1, 2, 4 s: back-off, not a reconnect storm
     assert src.recoveries == 1
+
+
+def test_local_file_stops_retrying_after_a_few_failed_reopens(make_video):
+    """A damaged/short local file ends early; hammering reopen() would only waste CPU."""
+    path = make_video(frames=40, fps=10.0)
+    ft = FakeTime()
+    reopens = []
+    with VideoLoader(path) as loader:
+        src = SyncedVideoSource(loader, clock=ft)
+        src.frame_at(0.0)
+        loader.read = lambda: (False, None)  # type: ignore[method-assign]
+        loader.reopen = lambda i: reopens.append(i) or False  # type: ignore[method-assign]
+        for _ in range(60):
+            ft.t += 1.0
+            src.frame_at(1.0)
+    assert len(reopens) == SyncedVideoSource.LOCAL_MAX_ATTEMPTS
+    assert src.exhausted and not src.recovering
 
 
 def test_background_source_never_blocks_the_ui_thread(make_video):

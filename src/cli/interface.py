@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from rich.console import Console
+from rich.markup import escape
 
 from src.ui.colors import PALETTE
 from src.ui.layout import build_summary, build_title
+from src.utils.dependencies import Check
 from src.video.video_loader import VideoInfo
 from src.video.video_player import PlaybackStats
 
@@ -68,3 +70,20 @@ class Interface:
     def show_warning(self, message: str) -> None:
         """Print a warning line."""
         self.console.print(f"[{PALETTE.warning}]![/] [{PALETTE.text}]{message}[/]")
+
+    def show_checks(self, checks: list[Check]) -> None:
+        """Print the ``--doctor`` report."""
+        self.console.print(f"[{PALETTE.accent}]ASCII MUSIC PLAYER[/] [{PALETTE.dim}]environment check[/]")
+        self.console.print()
+        for c in checks:
+            mark = f"[{PALETTE.accent}]✓[/]" if c.ok else (
+                f"[{PALETTE.error}]✗[/]" if c.required else f"[{PALETTE.warning}]![/]")
+            self.console.print(f"{mark} [{PALETTE.text}]{escape(c.name):<18}[/] [{PALETTE.dim}]{escape(c.detail)}[/]")
+            if not c.ok and c.hint:
+                self.console.print(f"    [{PALETTE.warning}]{escape(c.hint)}[/]")
+        failed = [c for c in checks if c.required and not c.ok]
+        self.console.print()
+        if failed:
+            self.console.print(f"[{PALETTE.error}]{len(failed)} required check(s) failed.[/]")
+        else:
+            self.console.print(f"[{PALETTE.accent}]Everything required is in place.[/]")

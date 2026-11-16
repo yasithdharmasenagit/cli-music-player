@@ -1,0 +1,57 @@
+# ASCII Music Player configuration.
+# Every setting is optional: delete a line to use the default.
+# Command-line flags always override this file.
+# Show the effective settings with:  python run.py --show-config
+
+[video]
+# Picture quality: "low" (fast), "balanced" (default) or "high" (most detail).
+quality = "balanced"
+# Maximum picture width in characters. 0 = automatic (set by the quality; always fitted to the window).
+width = 0
+# Coloured output (heavier on the terminal).
+color = false
+# Invert brightness (for light terminal themes).
+invert = false
+# Calm the picture: ignore tiny frame-to-frame brightness noise so still areas do not shimmer.
+stabilize = true
+# Custom character ramp from darkest to brightest. Empty = use the quality's ramp.
+charset = ""
+
+[audio]
+# Initial volume, 0-130 (above 100 amplifies).
+volume = 80
+# How much the Up/Down keys change the volume.
+volume_step = 5
+# How many seconds the Left/Right keys seek.
+seek_step = 5
+# Full path to mpv.exe if it is not on your PATH. Empty = search automatically.
+mpv_path = ""
+
+[lyrics]
+# Look up synchronized lyrics automatically.
+enabled = true
+# Show the lyrics panel when playback starts (toggle with the L key).
+show = true
+# Seconds to wait for the lyrics service before giving up (it runs in the background).
+timeout = 20
+api_url = "https://lrclib.net/api"
+# How many tracks' lyrics to keep cached on disk (oldest are removed). 0 = do not cache at all.
+cache_max_entries = 500
+
+[ui]
+# Show the ASCII video when playback starts (toggle with the V key).
+show_video = true
+# Maximum screen redraws per second. 0 = automatic (set by the quality).
+fps = 0
+# Use the terminal's alternate screen so your scrollback is untouched afterwards.
+alt_screen = true
+
+[paths]
+# Folder for cached lyrics and logs. Empty = the default per-user location.
+cache_dir = ""
+
+[logging]
+# Write a rotating log file (<cache_dir>/logs/player.log). Credentials and URL tokens are redacted.
+enabled = true
+# DEBUG, INFO, WARNING or ERROR.
+level = "INFO"
